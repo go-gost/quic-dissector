@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # Standalone module build — resolve the local tls-dissector dependency
+    # via a replace directive injected by the Prepare step.
+    env:
+      GOWORK: off
+    defaults:
+      run:
+        working-directory: quic-dissector
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: quic-dissector/go.mod
+
+      - name: Prepare
+        run: go mod edit -replace github.com/go-gost/tls-dissector=../tls-dissector
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test ./...
+
+      # Fuzz regression net: Go fuzzes exactly one target per `go test -fuzz`
+      # invocation, so enumerate the Fuzz* functions and run each for a short
+      # window. A crasher here is a panic/DoS regression and fails the job.
+      - name: Fuzz
+        run: |
+          for fn in $(grep -rhoE 'func (Fuzz[[:alnum:]_]+)' --include='*_test.go' . | sed 's/func //'); do
+            go test -fuzz="^${fn}$" -fuzztime=30s .
+          done
