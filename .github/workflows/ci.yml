@@ -11,23 +11,13 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
-    # Standalone module build — resolve the local tls-dissector dependency
-    # via a replace directive injected by the Prepare step.
-    env:
-      GOWORK: off
-    defaults:
-      run:
-        working-directory: quic-dissector
     steps:
       - uses: actions/checkout@v4
 
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version-file: quic-dissector/go.mod
-
-      - name: Prepare
-        run: go mod edit -replace github.com/go-gost/tls-dissector=../tls-dissector
+          go-version-file: go.mod
 
       - name: Vet
         run: go vet ./...
