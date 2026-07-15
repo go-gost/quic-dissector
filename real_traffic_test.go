@@ -45,6 +45,14 @@ func TestSniffQUIC_RealTraffic(t *testing.T) {
 			},
 			wantSNI: "www.google.com",
 		},
+			{
+				name: "v2-synthetic",
+				pktHex: []string{
+					"cb6b3343cf08c6cc8621f70272b4080802ba803c2a73b40040578a8827a0b20f4c12da35b6e5e5065230326db55c4118679313abd5d4992dd90496cb957bccf60afa3f2bb7ef9a1629994e81dc94d5eb15ab5b908ed12b928b67828ad17e8a21efe0b1c1389d20902210265df4a9bfdc0e",
+					"cb6b3343cf08c6cc8621f70272b4080802ba803c2a73b40040584228527131fa406971df053ff76600f25b743e9dfa41a7b31245051ada98a01fbf178997c6cc851b66a76dde9125ebe291f90facd5d2c2d2fecf23007a2661de5a3fc01901bb9e06d6275f86e5348d614363712cbe489028",
+				},
+				wantSNI: "v2.example.com",
+			},
 	}
 
 	for _, tc := range tests {
