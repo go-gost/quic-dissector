@@ -35,7 +35,40 @@ func TestVarintTruncated(t *testing.T) {
 }
 
 func TestSniffInitial(t *testing.T) {
-	// Build a minimal QUIC Initial, encrypt it, then parse.
+	ch := []byte{0x01, 0x00, 0x00, 0x00} // ClientHello, length=0
+	packet := buildTestInitialPacket(t, quicVersion1, quicSaltV1[:], "quic hp", ch)
+	raw, err := SniffInitial(packet)
+	if err != nil {
+		t.Fatalf("SniffInitial error: %v", err)
+	}
+	if len(raw) == 0 {
+		t.Fatal("no handshake data returned")
+	}
+	if raw[0] != 0x01 {
+		t.Errorf("handshake type = %#x, want 0x01", raw[0])
+	}
+}
+
+func TestSniffInitial_V2(t *testing.T) {
+	ch := []byte{0x01, 0x00, 0x00, 0x00}
+	packet := buildTestInitialPacket(t, quicVersion2, quicSaltV2[:], "quic hp2", ch)
+	raw, err := SniffInitial(packet)
+	if err != nil {
+		t.Fatalf("SniffInitial (v2) error: %v", err)
+	}
+	if len(raw) == 0 {
+		t.Fatal("no handshake data returned")
+	}
+	if raw[0] != 0x01 {
+		t.Errorf("handshake type = %#x, want 0x01", raw[0])
+	}
+}
+
+// buildTestInitialPacket builds an encrypted QUIC Initial packet with the
+// given version, salt, hp label, and ClientHello payload.
+func buildTestInitialPacket(t *testing.T, version uint32, salt []byte, hpLabel string, ch []byte) []byte { // ponytail: hpLabel is "quic hp" (v1) or "quic hp2" (v2)
+	t.Helper()
+
 	dcid := make([]byte, 8)
 	if _, err := io.ReadFull(rand.Reader, dcid); err != nil {
 		t.Fatal(err)
@@ -45,19 +78,13 @@ func TestSniffInitial(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Fake ClientHello bytes (handshake type=0x01, length=0, no body).
-	ch := []byte{0x01, 0x00, 0x00, 0x00}
-
-	// Build CRYPTO frame.
 	var payload []byte
-	payload = AppendVarint(payload, 0x06) // CRYPTO
-	payload = AppendVarint(payload, 0)    // offset = 0
+	payload = AppendVarint(payload, 0x06)
+	payload = AppendVarint(payload, 0)
 	payload = AppendVarint(payload, uint64(len(ch)))
 	payload = append(payload, ch...)
 
-	// Derive keys.
-	initialSalt := [...]byte{0x38, 0x76, 0x2c, 0xf7, 0xf5, 0x59, 0x34, 0xb3, 0x4d, 0x17, 0x9a, 0xe6, 0xa4, 0xc8, 0x0c, 0xad, 0xcc, 0xbb, 0x7f, 0x0a}
-	initialSecret := hkdf.Extract(sha256.New, dcid, initialSalt[:])
+	initialSecret := hkdf.Extract(sha256.New, dcid, salt)
 	clientSecret, err := hkdfExpandLabel(initialSecret, "client in", nil, 32)
 	if err != nil {
 		t.Fatal(err)
@@ -70,7 +97,7 @@ func TestSniffInitial(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	hpKey, err := hkdfExpandLabel(clientSecret, "quic hp", nil, 16)
+	hpKey, err := hkdfExpandLabel(clientSecret, hpLabel, nil, 16)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -78,17 +105,15 @@ func TestSniffInitial(t *testing.T) {
 	flags := byte(0xc0)
 	var hdr []byte
 	hdr = append(hdr, flags)
-	hdr = binary.BigEndian.AppendUint32(hdr, quicVersion1)
+	hdr = binary.BigEndian.AppendUint32(hdr, version)
 	hdr = append(hdr, byte(len(dcid)))
 	hdr = append(hdr, dcid...)
 	hdr = append(hdr, byte(len(scid)))
 	hdr = append(hdr, scid...)
-	hdr = AppendVarint(hdr, 0) // zero-length token
+	hdr = AppendVarint(hdr, 0)
 
-	// PN = 0 (1 byte).
 	pn := byte(0)
 
-	// AEAD encrypt.
 	nonce := make([]byte, 12)
 	copy(nonce, iv)
 	nonce[11] ^= pn
@@ -105,23 +130,19 @@ func TestSniffInitial(t *testing.T) {
 	hdr = AppendVarint(hdr, uint64(1+len(payload)+gcm.Overhead()))
 	aadLenOffset := len(hdr)
 
-	// Append PN (temporary, will mask).
 	hdr = append(hdr, pn)
 	ct := gcm.Seal(nil, nonce, payload, hdr)
 
-	// Build final packet.
 	pnOffset := aadLenOffset
 	packet := make([]byte, pnOffset, pnOffset+1+len(ct))
 	copy(packet, hdr[:pnOffset])
 	packet = append(packet, hdr[pnOffset])
 	packet = append(packet, ct...)
 
-	// Pad to > 16 bytes for sample.
 	for len(packet) < pnOffset+4+16 {
 		packet = append(packet, 0)
 	}
 
-	// Apply header protection mask.
 	sample := packet[pnOffset+4 : pnOffset+4+16]
 	hpBlock, _ := aes.NewCipher(hpKey)
 	mask := make([]byte, 16)
@@ -129,18 +150,7 @@ func TestSniffInitial(t *testing.T) {
 	packet[0] ^= (mask[0] & 0x0f)
 	packet[pnOffset] ^= mask[1]
 
-	// Now try to sniff.
-	raw, err := SniffInitial(packet)
-	if err != nil {
-		t.Fatalf("SniffInitial error: %v", err)
-	}
-	if len(raw) == 0 {
-		t.Fatal("no handshake data returned")
-	}
-	// First byte should be handshake type 0x01 (ClientHello).
-	if raw[0] != 0x01 {
-		t.Errorf("handshake type = %#x, want 0x01", raw[0])
-	}
+	return packet
 }
 
 func TestSniffInitial_Empty(t *testing.T) {

@@ -28,6 +28,14 @@ func FuzzSniffQUIC(f *testing.F) {
 	// Seed: valid QUIC Initial with minimal ClientHello (no SNI).
 	if pkt := buildQUICInitialRaw(f, makeMinimalClientHello()); pkt != nil {
 		f.Add(pkt)
+	// Seed: valid QUIC v2 Initial with SNI.
+	if pkt := buildQUICInitialRawV2(f, makeClientHelloWithSNI()); pkt != nil {
+		f.Add(pkt)
+	}
+	// Seed: valid QUIC v2 Initial with minimal ClientHello.
+	if pkt := buildQUICInitialRawV2(f, makeMinimalClientHello()); pkt != nil {
+		f.Add(pkt)
+	}
 	}
 	// Seed: non-Initial long-header (Handshake type).
 	f.Add([]byte{0xc2, 0x00, 0x00, 0x00, 0x01, 0x08})
@@ -52,6 +60,9 @@ func FuzzSniffQUIC(f *testing.F) {
 // and CRYPTO frame reassembly paths with arbitrary mutations.
 func FuzzSniffInitial(f *testing.F) {
 	if pkt := buildQUICInitialRaw(f, makeMinimalClientHello()); pkt != nil {
+		f.Add(pkt)
+	}
+	if pkt := buildQUICInitialRawV2(f, makeMinimalClientHello()); pkt != nil {
 		f.Add(pkt)
 	}
 	f.Add([]byte{})
@@ -118,7 +129,7 @@ func makeMinimalClientHello() []byte {
 	return body
 }
 
-// ---- QUIC Initial packet builder (fuzz-safe: no t.Fatal) ----
+// ---- QUIC v1 Initial packet builder (fuzz-safe) ----
 
 func buildQUICInitialRaw(f *testing.F, chBytes []byte) []byte {
 	_ = f
@@ -151,6 +162,84 @@ func buildQUICInitialRaw(f *testing.F, chBytes []byte) []byte {
 	var hdr []byte
 	hdr = append(hdr, flags)
 	hdr = binary.BigEndian.AppendUint32(hdr, 0x00000001)
+	hdr = append(hdr, byte(len(dcid)))
+	hdr = append(hdr, dcid...)
+	hdr = append(hdr, byte(len(scid)))
+	hdr = append(hdr, scid...)
+	hdr = quic.AppendVarint(hdr, 0)
+
+	pn := byte(0)
+
+	nonce := make([]byte, 12)
+	copy(nonce, iv)
+	nonce[11] ^= pn
+
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil
+	}
+
+	aadLenOffset := len(hdr)
+	hdr = quic.AppendVarint(hdr, uint64(1+len(payload)+gcm.Overhead()))
+	pnOffset := len(hdr)
+	hdr = append(hdr, pn)
+	ct := gcm.Seal(nil, nonce, payload, hdr)
+
+	packet := make([]byte, 0, aadLenOffset+len(hdr)-aadLenOffset+1+len(ct))
+	packet = append(packet, hdr[:pnOffset]...)
+	packet = append(packet, hdr[pnOffset])
+	packet = append(packet, ct...)
+
+	sampleStart := pnOffset + 4
+	for len(packet) < sampleStart+16 {
+		packet = append(packet, 0)
+	}
+	mask := aesECBEncryptRaw(hpKey, packet[sampleStart:sampleStart+16])
+	if mask == nil {
+		return nil
+	}
+	packet[0] ^= (mask[0] & 0x0f)
+	packet[pnOffset] ^= mask[1]
+
+	return packet
+}
+
+// buildQUICInitialRawV2 is like buildQUICInitialRaw but for QUIC v2 (RFC 9369).
+func buildQUICInitialRawV2(f *testing.F, chBytes []byte) []byte {
+	_ = f
+	var payload []byte
+	payload = quic.AppendVarint(payload, 0x06)
+	payload = quic.AppendVarint(payload, 0)
+	payload = quic.AppendVarint(payload, uint64(len(chBytes)))
+	payload = append(payload, chBytes...)
+
+	dcid := make([]byte, 8)
+	if _, err := io.ReadFull(rand.Reader, dcid); err != nil {
+		return nil
+	}
+	scid := make([]byte, 8)
+	if _, err := io.ReadFull(rand.Reader, scid); err != nil {
+		return nil
+	}
+
+	initialSalt := []byte{0x0d, 0xed, 0xe3, 0xde, 0xf7, 0x00, 0xa6, 0xdb, 0x81, 0x93, 0x81, 0xbe, 0x6e, 0x26, 0x9d, 0xcb, 0xf9, 0xbd, 0x2e, 0xd9}
+	initialSecret := hkdf.Extract(sha256.New, dcid, initialSalt)
+	clientSecret := hkdfExpandRaw(initialSecret, "client in", nil, 32)
+	key := hkdfExpandRaw(clientSecret, "quic key", nil, 16)
+	iv := hkdfExpandRaw(clientSecret, "quic iv", nil, 12)
+	hpKey := hkdfExpandRaw(clientSecret, "quic hp2", nil, 16)
+	if key == nil || iv == nil || hpKey == nil {
+		return nil
+	}
+
+	flags := byte(0xc0)
+	var hdr []byte
+	hdr = append(hdr, flags)
+	hdr = binary.BigEndian.AppendUint32(hdr, 0x6b3343cf)
 	hdr = append(hdr, byte(len(dcid)))
 	hdr = append(hdr, dcid...)
 	hdr = append(hdr, byte(len(scid)))

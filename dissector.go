@@ -5,7 +5,7 @@
 // Multiple datagrams from the same connection are supported: CRYPTO frames
 // from all are reassembled (gaps are zero-filled). Non-decryptable datagrams
 // (wrong keys, corrupted) are silently skipped.
-// Only QUIC v1 and draft-29 versions are supported.
+// Only QUIC v1, v2, and draft-29 versions are supported.
 package quicdissector
 
 import (

@@ -13,10 +13,14 @@ import (
 const (
 	quicVersion1       = 0x00000001
 	quicVersionDraft29 = 0xff00001d
+	quicVersion2       = 0x6b3343cf
 )
 
 // QUIC v1 Initial salt per RFC 9001 §5.2.
 var quicSaltV1 = [...]byte{0x38, 0x76, 0x2c, 0xf7, 0xf5, 0x59, 0x34, 0xb3, 0x4d, 0x17, 0x9a, 0xe6, 0xa4, 0xc8, 0x0c, 0xad, 0xcc, 0xbb, 0x7f, 0x0a}
+
+// QUIC v2 Initial salt per RFC 9369 §5.
+var quicSaltV2 = [...]byte{0x0d, 0xed, 0xe3, 0xde, 0xf7, 0x00, 0xa6, 0xdb, 0x81, 0x93, 0x81, 0xbe, 0x6e, 0x26, 0x9d, 0xcb, 0xf9, 0xbd, 0x2e, 0xd9}
 
 var (
 	ErrNotQUIC    = errors.New("not a QUIC packet")
@@ -36,7 +40,7 @@ type cryptoFragment struct {
 // Only the first datagram is parsed; cross-datagram CRYPTO reassembly
 // is out of scope — use SniffInitialMulti for that.
 // ponytail: QUIC v2 (RFC 9369, version 0x6b3343cf) has a different salt
-// and inverted type bits; add when observed in the wild.
+// and the "quic hp2" label for header protection key derivation.
 func SniffInitial(dgram []byte) ([]byte, error) {
 	return SniffInitialMulti(dgram)
 }
@@ -64,7 +68,7 @@ func SniffInitialMulti(dgrams ...[]byte) ([]byte, error) {
 	}
 
 	version := binary.BigEndian.Uint32(b[1:5])
-	if version != quicVersion1 && version != quicVersionDraft29 {
+	if version != quicVersion1 && version != quicVersionDraft29 && version != quicVersion2 {
 		return nil, ErrNotQUIC
 	}
 
@@ -76,7 +80,7 @@ func SniffInitialMulti(dgrams ...[]byte) ([]byte, error) {
 	}
 	dcid := b[pos : pos+dcidLen]
 
-	key, iv, hpKey, err := deriveInitialKeys(dcid)
+	key, iv, hpKey, err := deriveInitialKeys(dcid, version)
 	if err != nil {
 		return nil, ErrNotQUIC
 	}
@@ -113,9 +117,17 @@ func aesECBEncrypt(key, plaintext []byte) ([]byte, error) {
 }
 
 // deriveInitialKeys computes the Initial encryption keys from a
-// destination connection ID (RFC 9001 §5.2).
-func deriveInitialKeys(dcid []byte) (key, iv, hpKey []byte, err error) {
-	initialSecret := hkdf.Extract(sha256.New, dcid, quicSaltV1[:])
+// destination connection ID (RFC 9001 §5.2, RFC 9369 §5).
+func deriveInitialKeys(dcid []byte, version uint32) (key, iv, hpKey []byte, err error) {
+	var salt []byte
+	hpLabel := "quic hp"
+	if version == quicVersion2 {
+		salt = quicSaltV2[:]
+		hpLabel = "quic hp2"
+	} else {
+		salt = quicSaltV1[:]
+	}
+	initialSecret := hkdf.Extract(sha256.New, dcid, salt)
 	clientSecret, err := hkdfExpandLabel(initialSecret, "client in", nil, 32)
 	if err != nil {
 		return nil, nil, nil, err
@@ -128,7 +140,7 @@ func deriveInitialKeys(dcid []byte) (key, iv, hpKey []byte, err error) {
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	hpKey, err = hkdfExpandLabel(clientSecret, "quic hp", nil, 16)
+	hpKey, err = hkdfExpandLabel(clientSecret, hpLabel, nil, 16)
 	if err != nil {
 		return nil, nil, nil, err
 	}

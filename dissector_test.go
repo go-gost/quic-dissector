@@ -16,9 +16,10 @@ import (
 
 // ---- programmatic QUIC Initial packet builder ----
 
-// buildQUICInitial builds a valid QUIC v1 Initial packet containing the
+// buildQUICInitial builds a valid QUIC Initial packet containing the
 // given ClientHello handshake bytes (including the 4-byte handshake header).
-func buildQUICInitial(t *testing.T, chBytes []byte) []byte {
+// version selects the QUIC wire version (e.g. 0x00000001 for v1, 0x6b3343cf for v2).
+func buildQUICInitial(t *testing.T, chBytes []byte, version uint32) []byte {
 	t.Helper()
 
 	// Build CRYPTO frame payload: type(0x06) + offset(0) + length + data.
@@ -38,13 +39,21 @@ func buildQUICInitial(t *testing.T, chBytes []byte) []byte {
 		t.Fatal(err)
 	}
 
-	// Derive keys from DCID.
-	initialSalt := []byte{0x38, 0x76, 0x2c, 0xf7, 0xf5, 0x59, 0x34, 0xb3, 0x4d, 0x17, 0x9a, 0xe6, 0xa4, 0xc8, 0x0c, 0xad, 0xcc, 0xbb, 0x7f, 0x0a}
-	initialSecret := hkdf.Extract(sha256.New, dcid, initialSalt)
-	clientSecret := hkdfExpandLabel(t, initialSecret, "client in", nil, 32)
-	key := hkdfExpandLabel(t, clientSecret, "quic key", nil, 16)
-	iv := hkdfExpandLabel(t, clientSecret, "quic iv", nil, 12)
-	hpKey := hkdfExpandLabel(t, clientSecret, "quic hp", nil, 16)
+	// Derive keys from DCID, selecting salt and HP label by version.
+	var initialSalt []byte
+	hpLabel := "quic hp"
+	switch version {
+	case 0x6b3343cf: // QUIC v2 (RFC 9369)
+		initialSalt = []byte{0x0d, 0xed, 0xe3, 0xde, 0xf7, 0x00, 0xa6, 0xdb, 0x81, 0x93, 0x81, 0xbe, 0x6e, 0x26, 0x9d, 0xcb, 0xf9, 0xbd, 0x2e, 0xd9}
+		hpLabel = "quic hp2"
+	default: // QUIC v1, draft-29
+		initialSalt = []byte{0x38, 0x76, 0x2c, 0xf7, 0xf5, 0x59, 0x34, 0xb3, 0x4d, 0x17, 0x9a, 0xe6, 0xa4, 0xc8, 0x0c, 0xad, 0xcc, 0xbb, 0x7f, 0x0a}
+	}
+		initialSecret := hkdf.Extract(sha256.New, dcid, initialSalt)
+		clientSecret := hkdfExpandLabel(t, initialSecret, "client in", nil, 32)
+		key := hkdfExpandLabel(t, clientSecret, "quic key", nil, 16)
+		iv := hkdfExpandLabel(t, clientSecret, "quic iv", nil, 12)
+		hpKey := hkdfExpandLabel(t, clientSecret, hpLabel, nil, 16)
 
 	// Build unprotected header.
 	// Flags: Long Header(0x80) | Fixed Bit(0x40) | Initial(0x00) | PN Len(0x00 → 1 byte)
@@ -52,7 +61,7 @@ func buildQUICInitial(t *testing.T, chBytes []byte) []byte {
 
 	var hdr []byte
 	hdr = append(hdr, flags)             // 1 byte flags (protected)
-	hdr = binary.BigEndian.AppendUint32(hdr, 0x00000001) // QUIC v1
+	hdr = binary.BigEndian.AppendUint32(hdr, version)
 	hdr = append(hdr, byte(len(dcid)))   // DCID length
 	hdr = append(hdr, dcid...)           // DCID
 	hdr = append(hdr, byte(len(scid)))   // SCID length
@@ -175,7 +184,7 @@ func TestSniffQUIC(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	dgram := buildQUICInitial(t, chBytes)
+	dgram := buildQUICInitial(t, chBytes, 0x00000001)
 	info, err := SniffQUIC(dgram)
 	if err != nil {
 		t.Fatalf("SniffQUIC error: %v", err)
@@ -237,7 +246,7 @@ func TestSniffQUIC_Truncated(t *testing.T) {
 		Random:  dissector.Random{Time: 0},
 	}
 	chBytes, _ := ch.Encode()
-	full := buildQUICInitial(t, chBytes)
+	full := buildQUICInitial(t, chBytes, 0x00000001)
 
 	// Try truncating to various prefixes.
 	for _, trunc := range []int{5, 10, 20, 30, 40} {
@@ -261,13 +270,46 @@ func TestSniffQUIC_ClientHelloMissingSNI(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	dgram := buildQUICInitial(t, chBytes)
+	dgram := buildQUICInitial(t, chBytes, 0x00000001)
 	info, err := SniffQUIC(dgram)
 	if err != nil {
 		t.Fatalf("SniffQUIC error: %v", err)
 	}
 	if info.ServerName != "" {
 		t.Errorf("ServerName = %q, want empty", info.ServerName)
+	}
+}
+
+func TestSniffQUIC_V2(t *testing.T) {
+	ch := &dissector.ClientHelloMsg{
+		Version:            0x0303,
+		Random:             dissector.Random{Time: 1234567890},
+		SessionID:          []byte{0x01, 0x02, 0x03},
+		CipherSuites:       []uint16{0xC02B, 0xC02F, 0xCCA8},
+		CompressionMethods: []uint8{0x00},
+		Extensions: []dissector.Extension{
+			&dissector.ServerNameExtension{NameType: 0, Name: "v2.example.com"},
+			&dissector.SupportedVersionsExtension{Versions: []uint16{0x0304, 0x0303}},
+			&dissector.ALPNExtension{Protos: []string{"h3", "http/1.1"}},
+		},
+	}
+
+	chBytes, err := ch.Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dgram := buildQUICInitial(t, chBytes, 0x6b3343cf)
+	info, err := SniffQUIC(dgram)
+	if err != nil {
+		t.Fatalf("SniffQUIC v2 error: %v", err)
+	}
+
+	if info.ServerName != "v2.example.com" {
+		t.Errorf("ServerName = %q, want %q", info.ServerName, "v2.example.com")
+	}
+	if len(info.SupportedProtos) < 1 || info.SupportedProtos[0] != "h3" {
+		t.Errorf("SupportedProtos = %v, want [h3 ...]", info.SupportedProtos)
 	}
 }
 
