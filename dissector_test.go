@@ -135,6 +135,105 @@ func buildQUICInitial(t *testing.T, chBytes []byte, version uint32) []byte {
 	return packet
 }
 
+// buildQUICServerInitial builds a valid server QUIC Initial packet containing
+// the given ServerHello handshake bytes, encrypted with server Initial keys
+// derived from the DCID in firstClientDgram.
+func buildQUICServerInitial(t *testing.T, firstClientDgram, shBytes []byte) []byte {
+	t.Helper()
+
+	// Extract DCID and version from the client datagram.
+	dcid, version, err := quic.ParseInitialHeader(firstClientDgram)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Derive server Initial keys from the client's DCID.
+	var initialSalt []byte
+	hpLabel := "quic hp"
+	switch version {
+	case 0x6b3343cf:
+		initialSalt = []byte{0x0d, 0xed, 0xe3, 0xde, 0xf7, 0x00, 0xa6, 0xdb, 0x81, 0x93, 0x81, 0xbe, 0x6e, 0x26, 0x9d, 0xcb, 0xf9, 0xbd, 0x2e, 0xd9}
+		hpLabel = "quic hp2"
+	default:
+		initialSalt = []byte{0x38, 0x76, 0x2c, 0xf7, 0xf5, 0x59, 0x34, 0xb3, 0x4d, 0x17, 0x9a, 0xe6, 0xa4, 0xc8, 0x0c, 0xad, 0xcc, 0xbb, 0x7f, 0x0a}
+	}
+	initialSecret := hkdf.Extract(sha256.New, dcid, initialSalt)
+	serverSecret := hkdfExpandLabel(t, initialSecret, "server in", nil, 32)
+	key := hkdfExpandLabel(t, serverSecret, "quic key", nil, 16)
+	iv := hkdfExpandLabel(t, serverSecret, "quic iv", nil, 12)
+	hpKey := hkdfExpandLabel(t, serverSecret, hpLabel, nil, 16)
+
+	// Build CRYPTO frame payload.
+	var payload []byte
+	payload = quic.AppendVarint(payload, 0x06)           // CRYPTO frame type
+	payload = quic.AppendVarint(payload, 0)              // offset = 0
+	payload = quic.AppendVarint(payload, uint64(len(shBytes)))
+	payload = append(payload, shBytes...)
+
+	// Server-side DCID/SCID are arbitrary for this test.
+	srvDCID := make([]byte, 8)
+	if _, err := io.ReadFull(rand.Reader, srvDCID); err != nil {
+		t.Fatal(err)
+	}
+	srvSCID := make([]byte, 8)
+	if _, err := io.ReadFull(rand.Reader, srvSCID); err != nil {
+		t.Fatal(err)
+	}
+
+	flags := byte(0xc0)
+	var hdr []byte
+	hdr = append(hdr, flags)
+	hdr = binary.BigEndian.AppendUint32(hdr, version)
+	hdr = append(hdr, byte(len(srvDCID)))
+	hdr = append(hdr, srvDCID...)
+	hdr = append(hdr, byte(len(srvSCID)))
+	hdr = append(hdr, srvSCID...)
+	hdr = quic.AppendVarint(hdr, 0) // token length = 0
+
+	packetNumber := byte(0)
+	totalPNLen := 1
+
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	hdr = quic.AppendVarint(hdr, uint64(totalPNLen+len(payload)+gcm.Overhead()))
+	pnOffset := len(hdr)
+	hdr = append(hdr, packetNumber)
+
+	nonce := make([]byte, 12)
+	copy(nonce, iv)
+	nonce[11] ^= packetNumber
+
+	ct := gcm.Seal(nil, nonce, payload, hdr)
+
+	packet := make([]byte, 0, len(hdr)+len(ct))
+	packet = append(packet, hdr[:pnOffset]...)
+	packet = append(packet, hdr[pnOffset])
+	packet = append(packet, ct...)
+
+	// Apply header protection.
+	sampleStart := pnOffset + 4
+	for len(packet) < sampleStart+16 {
+		packet = append(packet, 0)
+	}
+	sample := packet[sampleStart : sampleStart+16]
+
+	mask, err := aesECBEncrypt(hpKey, sample)
+	if err != nil {
+		t.Fatal(err)
+	}
+	packet[0] ^= (mask[0] & 0x0f)
+	packet[pnOffset] ^= mask[1]
+
+	return packet
+}
+
 func aesECBEncrypt(key, plaintext []byte) ([]byte, error) {
 	block, err := aes.NewCipher(key)
 	if err != nil {
@@ -277,6 +376,117 @@ func TestSniffQUIC_ClientHelloMissingSNI(t *testing.T) {
 	}
 	if info.ServerName != "" {
 		t.Errorf("ServerName = %q, want empty", info.ServerName)
+	}
+}
+
+func TestSniffQUICServerHello_Basic(t *testing.T) {
+	// Build a ClientHello.
+	ch := &dissector.ClientHelloMsg{
+		Version:            0x0303,
+		Random:             dissector.Random{Time: 1234567890},
+		SessionID:          []byte{0x01, 0x02, 0x03},
+		CipherSuites:       []uint16{0xC02B, 0xC02F, 0xCCA8},
+		CompressionMethods: []uint8{0x00},
+		Extensions: []dissector.Extension{
+			&dissector.ServerNameExtension{NameType: 0, Name: "example.com"},
+			&dissector.SupportedVersionsExtension{Versions: []uint16{0x0304, 0x0303}},
+			&dissector.ALPNExtension{Protos: []string{"h3", "h2"}},
+		},
+	}
+	chBytes, err := ch.Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	clientDgram := buildQUICInitial(t, chBytes, 0x00000001)
+
+	// Build a ServerHello with negotiated values.
+	sh := &dissector.ServerHelloMsg{
+		Version:           0x0303,
+		Random:            dissector.Random{Time: 987654321},
+		SessionID:         []byte{0xAA, 0xBB},
+		CipherSuite:       0x1301, // TLS_AES_128_GCM_SHA256
+		CompressionMethod: 0x00,
+		Extensions: []dissector.Extension{
+			&dissector.SupportedVersionsExtension{Versions: []uint16{0x0304}},
+			&dissector.ALPNExtension{Protos: []string{"h3"}},
+		},
+	}
+	shBytes, err := sh.Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	serverDgram := buildQUICServerInitial(t, clientDgram, shBytes)
+	info, err := SniffQUICServerHello(clientDgram, serverDgram)
+	if err != nil {
+		t.Fatalf("SniffQUICServerHello error: %v", err)
+	}
+
+	if info.CipherSuite != 0x1301 {
+		t.Errorf("CipherSuite = 0x%x, want 0x1301", info.CipherSuite)
+	}
+	if info.CompressionMethod != 0 {
+		t.Errorf("CompressionMethod = %d, want 0", info.CompressionMethod)
+	}
+	if info.Version != 0x0304 {
+		t.Errorf("Version = 0x%x, want 0x0304", info.Version)
+	}
+	if info.Proto != "h3" {
+		t.Errorf("Proto = %q, want %q", info.Proto, "h3")
+	}
+}
+
+func TestSniffQUICServerHello_V2(t *testing.T) {
+	ch := &dissector.ClientHelloMsg{
+		Version:            0x0303,
+		Random:             dissector.Random{Time: 0},
+		CipherSuites:       []uint16{0x1301},
+		CompressionMethods: []uint8{0x00},
+		Extensions: []dissector.Extension{
+			&dissector.ServerNameExtension{NameType: 0, Name: "v2.example.com"},
+			&dissector.ALPNExtension{Protos: []string{"h3"}},
+		},
+	}
+	chBytes, err := ch.Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	clientDgram := buildQUICInitial(t, chBytes, 0x6b3343cf)
+
+	sh := &dissector.ServerHelloMsg{
+		Version:           0x0303,
+		Random:            dissector.Random{Time: 0},
+		CipherSuite:       0x1301,
+		CompressionMethod: 0x00,
+		Extensions: []dissector.Extension{
+			&dissector.SupportedVersionsExtension{Versions: []uint16{0x0304}},
+			&dissector.ALPNExtension{Protos: []string{"h3"}},
+		},
+	}
+	shBytes, err := sh.Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	serverDgram := buildQUICServerInitial(t, clientDgram, shBytes)
+	info, err := SniffQUICServerHello(clientDgram, serverDgram)
+	if err != nil {
+		t.Fatalf("SniffQUICServerHello v2 error: %v", err)
+	}
+	if info.CipherSuite != 0x1301 {
+		t.Errorf("CipherSuite = 0x%x, want 0x1301", info.CipherSuite)
+	}
+	if info.Proto != "h3" {
+		t.Errorf("Proto = %q, want %q", info.Proto, "h3")
+	}
+}
+
+func TestSniffQUICServerHello_BadClientDgram(t *testing.T) {
+	_, err := SniffQUICServerHello(nil, []byte{0x00})
+	if err == nil {
+		t.Fatal("expected error for nil client datagram")
 	}
 }
 

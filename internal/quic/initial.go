@@ -45,6 +45,33 @@ func SniffInitial(dgram []byte) ([]byte, error) {
 	return SniffInitialMulti(dgram)
 }
 
+// ParseInitialHeader extracts the Destination Connection ID and QUIC version
+// from a client Initial packet header without performing decryption.
+func ParseInitialHeader(b []byte) (dcid []byte, version uint32, err error) {
+	if len(b) < 7 {
+		return nil, 0, ErrNotQUIC
+	}
+	// Long header check: bit 7 set for long header, bit 6 fixed bit.
+	if b[0]&0xc0 != 0xc0 {
+		return nil, 0, ErrNotQUIC
+	}
+	// Check Initial type: bits 5-4 must be 0.
+	if b[0]&0x30 != 0 {
+		return nil, 0, ErrNotInitial
+	}
+	version = binary.BigEndian.Uint32(b[1:5])
+	if version != quicVersion1 && version != quicVersionDraft29 && version != quicVersion2 {
+		return nil, 0, ErrNotQUIC
+	}
+	pos := 5 // after version
+	dcidLen := int(b[pos])
+	pos++
+	if dcidLen < 1 || dcidLen > 20 || len(b) < pos+dcidLen+1 {
+		return nil, 0, ErrNotQUIC
+	}
+	return b[pos : pos+dcidLen], version, nil
+}
+
 // SniffInitialMulti merges CRYPTO frames from multiple QUIC Initial datagrams
 // in the same connection. Uses the first datagram for key derivation (DCID).
 // Datagrams that fail decryption (wrong DCID, corrupted) are silently skipped.
@@ -147,6 +174,37 @@ func deriveInitialKeys(dcid []byte, version uint32) (key, iv, hpKey []byte, err 
 	return key, iv, hpKey, nil
 }
 
+// deriveServerInitialKeys computes the server Initial encryption keys from a
+// destination connection ID (RFC 9001 §5.2, RFC 9369 §5).
+func deriveServerInitialKeys(dcid []byte, version uint32) (key, iv, hpKey []byte, err error) {
+	var salt []byte
+	hpLabel := "quic hp"
+	if version == quicVersion2 {
+		salt = quicSaltV2[:]
+		hpLabel = "quic hp2"
+	} else {
+		salt = quicSaltV1[:]
+	}
+	initialSecret := hkdf.Extract(sha256.New, dcid, salt)
+	serverSecret, err := hkdfExpandLabel(initialSecret, "server in", nil, 32)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	key, err = hkdfExpandLabel(serverSecret, "quic key", nil, 16)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	iv, err = hkdfExpandLabel(serverSecret, "quic iv", nil, 12)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	hpKey, err = hkdfExpandLabel(serverSecret, hpLabel, nil, 16)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	return key, iv, hpKey, nil
+}
+
 // decryptDgram removes header protection and AEAD-decrypts one Initial packet,
 // returning any CRYPTO frames found in the payload. Modifies d in place.
 func decryptDgram(d []byte, hpKey, key, iv []byte) ([]cryptoFragment, error) {
@@ -210,10 +268,11 @@ func decryptDgram(d []byte, hpKey, key, iv []byte) ([]cryptoFragment, error) {
 
 	// --- AEAD decryption ---
 	payloadStart := pnOffset + pnLen
-	if len(d) < payloadStart+16 {
+	ctLen := int(remainingLen) - pnLen // encrypted payload size, excluding padding
+	if ctLen < 16 || len(d) < payloadStart+ctLen {
 		return nil, ErrNotQUIC
 	}
-	ct := d[payloadStart:]
+	ct := d[payloadStart : payloadStart+ctLen]
 
 	// Nonce = iv XOR truncated packet number (big-endian, zero-padded to 12).
 	nonce := make([]byte, 12)
@@ -348,4 +407,32 @@ func buildCRYPTO(frags []cryptoFragment) []byte {
 		copy(buf[f.offset:], f.data)
 	}
 	return buf
+}
+
+// SniffServerInitialMulti merges CRYPTO frames from server QUIC Initial datagrams
+// using server Initial keys derived from the given DCID and QUIC version.
+func SniffServerInitialMulti(dcid []byte, version uint32, dgrams ...[]byte) ([]byte, error) {
+	if len(dgrams) == 0 {
+		return nil, ErrNotQUIC
+	}
+
+	key, iv, hpKey, err := deriveServerInitialKeys(dcid, version)
+	if err != nil {
+		return nil, ErrNotQUIC
+	}
+
+	var allFrags []cryptoFragment
+	for _, d := range dgrams {
+		frags, err := decryptDgram(d, hpKey, key, iv)
+		if err != nil {
+			continue // mismatched keys, skip
+		}
+		allFrags = append(allFrags, frags...)
+	}
+
+	if len(allFrags) == 0 {
+		return nil, ErrNotQUIC
+	}
+
+	return buildCRYPTO(allFrags), nil
 }

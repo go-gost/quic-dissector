@@ -42,3 +42,31 @@ func SniffQUIC(dgrams ...[]byte) (*dissector.ClientHelloInfo, error) {
 
 	return dissector.ParseClientHello(bytes.NewReader(record))
 }
+
+// SniffQUICServerHello decrypts server QUIC Initial datagrams using server
+// Initial keys derived from the DCID in firstClientDgram, and parses the
+// TLS ServerHello. firstClientDgram is the client's first QUIC Initial packet
+// (used only for DCID extraction, not decrypted here).
+//
+// Returns the ServerHello info (CipherSuite, Version, Proto from ALPN),
+// or quic.ErrNotQUIC when the datagrams cannot be parsed.
+func SniffQUICServerHello(firstClientDgram []byte, serverDgrams ...[]byte) (*dissector.ServerHelloInfo, error) {
+	dcid, version, err := quic.ParseInitialHeader(firstClientDgram)
+	if err != nil {
+		return nil, err
+	}
+
+	rawSH, err := quic.SniffServerInitialMulti(dcid, version, serverDgrams...)
+	if err != nil {
+		return nil, err
+	}
+
+	// Prepend a synthetic TLS record header: ContentType Handshake (0x16),
+	// Version TLS 1.2 (0x0303), 2-byte length.
+	record := make([]byte, 0, 5+len(rawSH))
+	record = append(record, 0x16, 0x03, 0x03)
+	record = binary.BigEndian.AppendUint16(record, uint16(len(rawSH)))
+	record = append(record, rawSH...)
+
+	return dissector.ParseServerHello(bytes.NewReader(record))
+}

@@ -77,3 +77,59 @@ func TestSniffQUIC_RealTraffic(t *testing.T) {
 		})
 	}
 }
+
+func TestSniffQUICServerHello_RealTraffic(t *testing.T) {
+	// Real captured QUIC v1 traffic from cloudflare-quic.com:443.
+	// Client Initial DCID=a8bd1dc0d3be7f17, version=0x1.
+	clientPkt0 := "c70000000108a8bd1dc0d3be7f17084fb94e0332197c380041f6a24cda9050ee92b909d9fbcd516f318477fe09af99cd9ae0c6a6b48d1f60013e651df5babd966fd6d8fdc7bf558c0966b3d97ffa97738947408abf0b40d817bc8442c88b9fd781feae18034f5d72541836e489ac0c560c1b2f233e75646d72022caba6c5375d7fc606afcb49ed57d4785fcc9a556c41e20bfcf8f83af068514549d11d689d89d84cb676697743dfa85fee03ace4fe76efa8171d5469b3b6f377e56e397012de077ff5895321ff049bf729439b56259d202b9ed9d1900965d390065916446fd9fd3a3d8627e301c00081a3ca9f698bd271b1ce54b791ae475e955d670e9e08f2df0ba6e4552c4e9b4dd3ff5602d816dfe9cbbfb9a3da967397075d6021b07c727080bf1a840145c515a04a7758906677b40a2da43940ff0e57b1324949b8409ce0e6205f9b6ec1ee43c6859514992bbc963eb1bc78647ad05fa60b2b739f97e630731fe9c67e6785911ec7faf601be40236495ea7a8552311acba763822adfb4848a57d1e28315672241882d2520d6fb589af3cf72790dcd4cd97cbb575bb8b01257e7aeaa3e5ce3216c28ed1e274c02fd19d3926567926ae67b421c3e5d070248118316177afa09fe61c5f52a318208805e7655a9a85da2e2f41ff34fd31708d6aa641794e62698d55d9b22afa0d9ee70eacc6a49f7b05510f1e1186d364b69de6de40c1d6eaa2525ac15a301ee4c3e"
+
+	tests := []struct {
+		name            string
+		serverHex       string
+		wantCipherSuite uint16
+		wantVersion     uint16
+		wantProto       string
+	}{
+		{
+			name:            "cloudflare-quic-v1-real",
+			serverHex:       "cf00000001084fb94e0332197c3814011c6cea08595ee3501f93ea5a59733494fc958800406ff09ba0eed146dc0e9cf4cec7443cfb17a70f332e79fe77d6644e5691cf912d7dc61d452a15c6b2cb6d3b62268b12340824824600e9774ccc9395f66f4cefa5b0809a7378e6178ffca31a2abffc3394ca84d0011a6d2a2f1085a249a8a02b016169c4cc4d8e4a9eaf23bfd61ea265b5",
+			wantCipherSuite: 0x1302,
+			wantVersion:     0x0304,
+			wantProto:       "",
+		},
+	}
+
+	clientPkt0Bytes, err := hex.DecodeString(clientPkt0)
+	if err != nil {
+		t.Fatalf("decode client pkt0: %v", err)
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			serverPkt, err := hex.DecodeString(tc.serverHex)
+			if err != nil {
+				t.Fatalf("decode server hex: %v", err)
+			}
+
+			info, err := SniffQUICServerHello(clientPkt0Bytes, serverPkt)
+			if err != nil {
+				t.Fatalf("SniffQUICServerHello: %v", err)
+			}
+
+			t.Logf("CipherSuite=0x%x Version=0x%x Proto=%q", info.CipherSuite, info.Version, info.Proto)
+
+			if info.CipherSuite != tc.wantCipherSuite {
+				t.Errorf("CipherSuite = 0x%x, want 0x%x", info.CipherSuite, tc.wantCipherSuite)
+			}
+			if info.Version != tc.wantVersion {
+				t.Errorf("Version = 0x%x, want 0x%x", info.Version, tc.wantVersion)
+			}
+			if info.CompressionMethod != 0 {
+				t.Errorf("CompressionMethod = %d, want 0", info.CompressionMethod)
+			}
+			if info.Proto != tc.wantProto {
+				t.Errorf("Proto = %q, want %q", info.Proto, tc.wantProto)
+			}
+		})
+	}
+}
